@@ -1,0 +1,23 @@
+# 编辑器 / 系统
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 项目机密
+.env
+*.key
+*.pem
+certs/
+cert/
+*.bak.*
+*.log

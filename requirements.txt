@@ -1,0 +1,4 @@
+alibabacloud-cas20200407>=3.0.0
+alibabacloud-alidns20150109>=3.0.0
+cryptography>=41.0.0
+python-dotenv>=1.0.0
