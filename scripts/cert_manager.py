@@ -6,6 +6,8 @@
   1. 检查本地证书有效期
   2. 检查 CAS 平台是否已有有效证书（已签发、未过期）
   3. 本地和平台均无有效证书时，自动申请阿里云 DV / OV / EV 证书
+     （平台托管模式：不传 CSR，由阿里云生成并保管密钥对，签发后连私钥一并返回，
+      旧证书私钥丢失时可直接从平台重新下载）
   4. 自动完成 DNS 验证（需阿里云 DNS 服务）
   5. 下载证书到指定目录或文件路径
   6. 守护进程模式 (--daemon)，定时执行续期检查（用于容器化部署）
@@ -35,7 +37,9 @@
   CERT_TYPE                        证书类型预设 (free-dv/dv/ov/ev)
   PRODUCT_CODE                     阿里云 product_code (覆盖 CERT_TYPE)
   RENEWAL_DAYS                     提前多少天续期 (默认 30)
-  CERT_SANS                        额外 SAN 域名，逗号分隔
+  CERT_SANS                        额外 SAN 域名，逗号分隔（仅用于日志展示；
+                                   平台托管模式下 SAN 由阿里云按主域名自动匹配，
+                                   需自定义 SAN 请在阿里云控制台申请）
   ALIBABA_DNS_DOMAIN               阿里云 DNS 管理的域名 (默认同 CERT_DOMAIN)
   RELOAD_CMD                       自定义重载命令 (如 "docker compose restart blog")
   NO_RELOAD                        设为 1 禁用自动 reload
@@ -92,6 +96,8 @@ class Config:
     daemon: bool = False
     interval_hours: float = DEFAULT_INTERVAL_HOURS
     run_once: bool = False
+    force_renew: bool = False
+    renew: bool = False
 
 
 # ---------- sdk imports (lazy) ----------
@@ -131,8 +137,6 @@ def _load_sdk() -> None:
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 
 
@@ -175,10 +179,10 @@ def days_until_expiry(expiry: datetime.datetime) -> int:
     return (expiry - datetime.datetime.now(datetime.timezone.utc)).days
 
 
-# ---------- CSR & key generation ----------
+# ---------- domain resolution ----------
 
 def resolve_cert_domains(primary_domain: str, extra_sans: str) -> list:
-    """解析完整的证书域名列表（主域名 + www 赠送 + 手动追加的 SAN）"""
+    """解析目标域名列表（用于日志展示与核对，实际 SAN 由阿里云按 domain 自动匹配）"""
     domains = [primary_domain]
     if not primary_domain.startswith("www."):
         www_domain = f"www.{primary_domain}"
@@ -192,47 +196,13 @@ def resolve_cert_domains(primary_domain: str, extra_sans: str) -> list:
     return domains
 
 
-def generate_key_and_csr(domains: list) -> Tuple[str, str]:
-    """生成 RSA 私钥和 CSR，返回 (key_pem, csr_pem)"""
-    primary = domains[0]
-    log("生成 2048 位 RSA 私钥 ...")
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend(),
-    )
-    key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-
-    log(f"生成 CSR (CN={primary}, SANs={domains[1:] or '无'}) ...")
-    csr_builder = x509.CertificateSigningRequestBuilder().subject_name(
-        x509.Name([
-            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
-            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Shanghai"),
-            x509.NameAttribute(NameOID.LOCALITY_NAME, "Shanghai"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, primary),
-            x509.NameAttribute(NameOID.COMMON_NAME, primary),
-        ])
-    ).add_extension(
-        x509.SubjectAlternativeName([x509.DNSName(d) for d in domains]),
-        critical=False,
-    )
-    csr = csr_builder.sign(private_key, hashes.SHA256(), default_backend())
-    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    return key_pem, csr_pem
-
-
 # ---------- CAS API ----------
 
-def create_certificate_order(domain: str, csr_pem: str, product_code: str) -> str:
-    """申请证书，返回 OrderId"""
+def create_certificate_order(domain: str, product_code: str) -> str:
+    """申请证书（不传 CSR，由阿里云生成并保管密钥对），返回 OrderId"""
     client = _create_cas_client()
     req = CasModels.CreateCertificateForPackageRequestRequest(
         domain=domain,
-        csr=csr_pem,
         validate_type="DNS",
         product_code=product_code,
         username="",
@@ -262,6 +232,18 @@ def get_certificate_state(order_id: str) -> dict:
     }
 
 
+def cancel_certificate_order(order_id: str) -> None:
+    """取消未签发的订单（DeleteCertificateRequest 只能删已签发证书，删不了 payed 状态订单）"""
+    try:
+        client = _create_cas_client()
+        client.cancel_certificate_for_package_request(
+            CasModels.CancelCertificateForPackageRequestRequest(order_id=int(order_id))
+        )
+        log(f"已取消订单 {order_id}")
+    except Exception as e:
+        log(f"取消订单 {order_id} 失败 (可忽略): {e}")
+
+
 def delete_certificate_order(order_id: str) -> None:
     try:
         client = _create_cas_client()
@@ -270,7 +252,7 @@ def delete_certificate_order(order_id: str) -> None:
         )
         log(f"已删除订单 {order_id}")
     except Exception as e:
-        log(f"删除订单 {order_id} 失败 (可忽略): {e}")
+        log(f"删除订单 {order_id} 失败: {e}")
 
 
 def list_platform_certificates(keyword: str = "", status: str = "ISSUED",
@@ -313,6 +295,7 @@ def _domain_matches(target: str, cert_common: str, cert_sans: str) -> bool:
 
 
 def find_valid_platform_cert(domain: str) -> Optional[int]:
+    """查找平台上有效且带私钥的证书；返回 cert_id，找不到返回 None"""
     log(f"查询平台上 {domain} 的已有证书 ...")
     orders = list_platform_certificates(keyword=domain, status="ISSUED", order_type="CERT")
     if not orders:
@@ -320,6 +303,7 @@ def find_valid_platform_cert(domain: str) -> Optional[int]:
         return None
 
     now = datetime.datetime.now(datetime.timezone.utc)
+    no_key_candidates = []
     for item in orders:
         end_date_str = getattr(item, "end_date", "") or ""
         cert_common = getattr(item, "common_name", "") or ""
@@ -336,12 +320,20 @@ def find_valid_platform_cert(domain: str) -> Optional[int]:
         except ValueError:
             continue
         remaining = (end_date - now).days
-        if remaining > 0:
-            log(f"平台找到有效证书: domain={cert_common}, cert_id={cert_id}, "
+        if remaining <= 0:
+            continue
+
+        # 只有能连私钥一起下载的证书才可复用
+        detail = get_certificate_detail(int(cert_id))
+        if detail and detail.get("cert") and detail.get("key"):
+            log(f"平台找到有效证书(含私钥): domain={cert_common}, cert_id={cert_id}, "
                 f"过期={end_date_str}, 剩余={remaining}天")
             return int(cert_id)
+        no_key_candidates.append(f"{cert_id}(过期={end_date_str}, 剩余={remaining}天, 无私钥)")
 
-    log("平台上未找到匹配的未过期证书")
+    if no_key_candidates:
+        log(f"平台证书均无私钥: {', '.join(no_key_candidates)}")
+    log("平台上未找到匹配且含私钥的未过期证书")
     return None
 
 
@@ -354,12 +346,22 @@ def download_platform_cert(cert_id: int) -> Optional[Tuple[str, str]]:
     if not cert_pem:
         log(f"平台证书 {cert_id} 无证书内容")
         return None
-    if not key_pem:
-        log(f"平台证书 {cert_id} 无私钥（可能创建时已下载），需要重新申请")
     return cert_pem, key_pem
 
 
 # ---------- DNS API ----------
+
+def resolve_dns_zone(record_domain: str, candidates: list) -> Optional[str]:
+    """从候选域名中找出 record_domain 实际所属的 DNS 托管域（取最长后缀匹配）"""
+    rd = record_domain.rstrip(".")
+    best = None
+    for cand in candidates:
+        c = cand.rstrip(".")
+        if rd == c or rd.endswith(f".{c}"):
+            if best is None or len(c) > len(best):
+                best = c
+    return best
+
 
 def _get_domain_record(domain: str, rr: str, type_: str) -> Optional[dict]:
     client = _create_dns_client()
@@ -395,11 +397,17 @@ def upsert_dns_record(domain: str, rr: str, type_: str, value: str) -> None:
 
 # ---------- issuance wait ----------
 
-def wait_for_issuance(order_id: str, dns_domain: str,
-                      timeout: int = 600, interval: int = 10) -> Optional[str]:
-    """轮询直到证书签发完成，返回证书 PEM"""
+def wait_for_issuance(order_id: str, dns_candidates: list,
+                      timeout: int = 600, interval: int = 10) -> Optional[Tuple[str, str]]:
+    """轮询直到证书签发完成，返回 (证书 PEM, 私钥 PEM)
+
+    dns_candidates: DNS 托管域名候选列表（按 record_domain 后缀自动匹配，
+                    解决 ALIBABA_DNS_DOMAIN 配错成父域名/子域名的问题）
+    dns_added: 函数内维护，只在首次添加后长等待，之后改短轮询（幂等不重复添加）
+    """
     deadline = time.time() + timeout
     log(f"等待证书签发 (最长 {timeout}s) ...")
+    dns_added = False
 
     while time.time() < deadline:
         state = get_certificate_state(order_id)
@@ -407,11 +415,15 @@ def wait_for_issuance(order_id: str, dns_domain: str,
 
         if status == "certificate":
             cert = state.get("certificate", "")
+            key = state.get("private_key", "")
             if not cert:
                 log("状态为 certificate 但未返回证书内容")
                 return None
+            if not key:
+                log("状态为 certificate 但未返回私钥")
+                return None
             log("证书已签发")
-            return cert
+            return cert, key
 
         if status in ("verify_fail", "failed"):
             log(f"证书申请失败: type={status}")
@@ -423,17 +435,22 @@ def wait_for_issuance(order_id: str, dns_domain: str,
             record_domain = state.get("record_domain", "")
             if record_type and record_value and record_domain:
                 log(f"需要 DNS 验证: 类型={record_type}, 记录值={record_value}, 记录域名={record_domain}")
-                if dns_domain:
-                    rr = (record_domain.replace(f".{dns_domain}", "")
-                           if record_domain.endswith(f".{dns_domain}")
-                           else record_domain.rstrip("."))
+                zone = resolve_dns_zone(record_domain, dns_candidates)
+                if not zone:
+                    log(f"WARN: {record_domain} 不匹配任何 DNS 托管域 {dns_candidates}，"
+                        f"跳过自动 DNS 验证（域名在阿里云 DNS 托管时平台会自动验证）")
+                else:
+                    rr = record_domain.rstrip(".")[: -(len(zone) + 1)] if \
+                        record_domain.rstrip(".") != zone else ""
                     if not rr:
                         log(f"WARN: 无法从 {record_domain} 提取 RR 前缀，跳过自动 DNS 验证")
                     else:
-                        upsert_dns_record(dns_domain, rr, record_type, record_value)
-                        log("DNS 记录已添加，等待验证生效 ...")
-                        time.sleep(60)
-                        continue
+                        upsert_dns_record(zone, rr, record_type, record_value)
+                        if not dns_added:
+                            dns_added = True
+                            log("DNS 记录已添加，等待验证生效 ...")
+                            time.sleep(60)
+                            continue
             else:
                 log(f"订单状态: {status}，等待进入验证阶段 ...")
         else:
@@ -536,8 +553,7 @@ def do_renew(cfg: Config) -> bool:
         log("错误: 未指定 --domain / CERT_DOMAIN")
         return False
 
-    domains = resolve_cert_domains(cfg.domain, cfg.sans)
-    log(f"目标域名列表: {domains}")
+    log(f"目标域名列表: {resolve_cert_domains(cfg.domain, cfg.sans)}")
 
     log("===== 第 1 步：检查本地证书 =====")
     if check_local_cert_valid(cfg):
@@ -549,15 +565,12 @@ def do_renew(cfg: Config) -> bool:
         cert_key = download_platform_cert(platform_cert_id)
         if cert_key:
             cert_pem, key_pem = cert_key
-            if key_pem:
-                log("平台证书含私钥，直接使用")
-                return save_and_apply_cert(cfg, cert_pem, key_pem)
-            log("平台证书无私钥（旧订单），需要重新申请")
-        else:
-            log("下载平台证书失败，需要重新申请")
+            log("平台证书含私钥，直接使用")
+            return save_and_apply_cert(cfg, cert_pem, key_pem)
+        log("下载平台证书失败，需要重新申请")
 
     log("===== 第 3 步：申请新证书 =====")
-    return _apply_new_cert(cfg, domains)
+    return _apply_new_cert(cfg)
 
 
 def do_renew_force(cfg: Config) -> bool:
@@ -566,39 +579,60 @@ def do_renew_force(cfg: Config) -> bool:
         log("错误: 未指定 --domain / CERT_DOMAIN")
         return False
 
-    domains = resolve_cert_domains(cfg.domain, cfg.sans)
-    log(f"目标域名列表: {domains}")
+    log(f"目标域名列表: {resolve_cert_domains(cfg.domain, cfg.sans)}")
     log("强制重新申请模式: 跳过本地和平台检查")
-    return _apply_new_cert(cfg, domains)
+    return _apply_new_cert(cfg)
 
 
-def _apply_new_cert(cfg: Config, domains: list) -> bool:
+def _dns_candidates(cfg: Config) -> list:
+    """DNS 托管域候选列表：显式配置 + 主域名及其各级父域，按后缀自动匹配"""
+    candidates = []
+    for c in (cfg.dns_domain, cfg.domain):
+        if c and c not in candidates:
+            candidates.append(c)
+            parts = c.split(".")
+            for i in range(2, len(parts)):
+                parent = ".".join(parts[-i:])
+                if parent not in candidates:
+                    candidates.append(parent)
+    return candidates
+
+
+def _cleanup_failed_order(order_id: str) -> None:
+    """失败订单清理：先取消（payed 状态），取消不了再尝试删除"""
+    cancel_certificate_order(order_id)
+    delete_certificate_order(order_id)
+
+
+def _apply_new_cert(cfg: Config) -> bool:
     old_cert_exists = cfg.cert_file.exists() and cfg.key_file.exists()
 
-    key_pem, csr_pem = generate_key_and_csr(domains)
+    log("使用平台生成密钥对模式（阿里云保管私钥，签发后回传）...")
 
     try:
-        order_id = create_certificate_order(cfg.domain, csr_pem, cfg.product_code)
+        order_id = create_certificate_order(cfg.domain, cfg.product_code)
     except Exception as e:
         log(f"创建证书订单失败: {e}")
         return False
 
     try:
-        cert_pem = wait_for_issuance(order_id, cfg.dns_domain)
+        result = wait_for_issuance(order_id, _dns_candidates(cfg))
     except KeyboardInterrupt:
         log("用户中断，清理订单 ...")
-        delete_certificate_order(order_id)
+        _cleanup_failed_order(order_id)
         return False
     except Exception as e:
         log(f"等待签发时出错: {e}")
-        delete_certificate_order(order_id)
+        # 警告：域名托管在阿里云 DNS 时，残留订单仍可能被平台自动验证并签发
+        _cleanup_failed_order(order_id)
         return False
 
-    if not cert_pem:
+    if not result:
         log("未能获取证书，清理订单 ...")
-        delete_certificate_order(order_id)
+        _cleanup_failed_order(order_id)
         return False
 
+    cert_pem, key_pem = result
     success = save_and_apply_cert(cfg, cert_pem, key_pem)
     if not success and old_cert_exists:
         log("新证书安装失败，旧证书仍然有效，请手动排查")
@@ -808,6 +842,8 @@ def parse_args(argv=None) -> Config:
     else:
         cfg.interval_hours = DEFAULT_INTERVAL_HOURS
     cfg.run_once = args.run_once
+    cfg.force_renew = args.force_renew
+    cfg.renew = args.renew
 
     return cfg
 
