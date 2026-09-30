@@ -410,6 +410,20 @@ def resolve_dns_zone(record_domain: str, candidates: list) -> Optional[str]:
     return best
 
 
+def _record_field(record, *names, default=""):
+    """兼容不同 SDK 版本的字段命名
+
+    alibabacloud-alidns20150109 4.x 中 DNS 解析记录的类型字段是 `type`，
+    3.x 里是 `type_`（旧版为避免与内置名冲突的写法）。requirements 允许 >=3.0.0，
+    故这里按顺序取第一个存在的字段，避免再次出现 AttributeError。
+    """
+    for n in names:
+        v = getattr(record, n, None)
+        if v is not None:
+            return v
+    return default
+
+
 def _get_domain_record(domain: str, rr: str, type_: str) -> Optional[dict]:
     client = _create_dns_client()
     resp = client.describe_domain_records(
@@ -417,9 +431,15 @@ def _get_domain_record(domain: str, rr: str, type_: str) -> Optional[dict]:
             domain_name=domain, rrkey_word=rr, type=type_,
         )
     )
-    for r in resp.body.domain_records.record:
-        if r.rr == rr:
-            return {"record_id": r.record_id, "rr": r.rr, "type": r.type_, "value": r.value}
+    records = resp.body.domain_records.record if resp.body.domain_records else []
+    for r in records or []:
+        if _record_field(r, "rr") == rr:
+            return {
+                "record_id": _record_field(r, "record_id"),
+                "rr": _record_field(r, "rr"),
+                "type": _record_field(r, "type", "type_"),
+                "value": _record_field(r, "value"),
+            }
     return None
 
 
