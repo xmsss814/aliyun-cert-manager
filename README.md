@@ -10,6 +10,9 @@
 - 可选的 nginx reload 或自定义重载命令
 - **Docker Compose 守护进程部署**（推荐）或 cron 定时
 
+> 密钥托管：**仅支持平台托管模式** —— 申请时不传 CSR/SAN，密钥对由阿里云生成并保管，签发后连私钥一并返回。
+> 因此不支持自定义 SAN（`--san` / `CERT_SANS` 会被忽略并告警），详见下文与 FAQ。
+
 ---
 
 ## 目录结构
@@ -138,6 +141,9 @@ python3 scripts/cert_manager.py --daemon --interval-hours 6 \
 
 # 立即执行一次后退出（调试用）
 python3 scripts/cert_manager.py --daemon --run-once
+
+# 跳过检查、强制重新签发一次（必须带 --run-once，否则拒绝启动）
+python3 scripts/cert_manager.py --daemon --force-renew --run-once
 ```
 
 或用 systemd 等进程管理工具托管：
@@ -156,6 +162,9 @@ WantedBy=multi-user.target
 
 环境变量 `DAEMON=1`、`INTERVAL_HOURS=12` 可替代命令行参数。
 
+> 模式优先级：命令行显式给出 `--check` / `--renew` / `--force-renew` 时以命令行为准，
+> 即使环境变量 `DAEMON=1` 也不会被强行拉进守护进程（容器内执行一次性 `--check` 时很有用）。
+
 ---
 
 ## 命令行参数
@@ -169,12 +178,13 @@ WantedBy=multi-user.target
 | `--interval-hours` | 守护进程间隔（小时） | `12` |
 | `--run-once` | 守护进程模式下立即执行一次后退出 | |
 | `--domain` | 证书主域名 | `CERT_DOMAIN` |
-| `--san` | 额外 SAN 域名，逗号分隔 | |
+| `--san` | **不支持**：平台托管模式不传 CSR，SAN 由阿里云按主域名自动匹配；传入仅告警并忽略 | |
 | `--dns-domain` | 阿里云 DNS 托管域名 | 同 `--domain` |
 | `--cert-dir` | 证书存放目录 | `./certs` |
 | `--cert-file` | 证书文件路径（覆盖 `--cert-dir/cert.pem`） | |
 | `--key-file` | 私钥文件路径（覆盖 `--cert-dir/key.pem`） | |
-| `--fullchain-file` | 完整链路径（覆盖 `--cert-dir/fullchain.pem`） | |
+| `--fullchain-file` | 完整链路径（覆盖 `--cert-dir/fullchain.pem`；显式传空字符串可关闭输出） | |
+| `--no-fullchain` | 不写出 `fullchain.pem` | off |
 | `--cert-type` | 证书预设：`free-dv`/`dv`/`ov`/`ev` | `free-dv` |
 | `--product-code` | 阿里云 product_code（覆盖 `--cert-type`） | |
 | `--renewal-days` | 提前多少天续期 | `30` |
@@ -186,6 +196,9 @@ WantedBy=multi-user.target
 | `--run-once` | 守护进程模式下立即执行一次后退出 | |
 
 > 优先级：命令行参数 > 环境变量 > .env > 默认值。
+
+> 冲突规则：`--daemon` 配 `--force-renew` 会每轮强制重新签发，因此**必须同时带 `--run-once`**，
+> 否则直接拒绝启动（exit 2）；`--daemon` 配 `--check` 时 `--check` 被忽略并告警。
 
 ---
 
@@ -292,6 +305,9 @@ cron 调用项目内的 `cert_manager.py --renew`，日志写入 `~/aliyun-cert-
 > **密钥托管说明**：采用平台托管模式，私钥由阿里云生成与保管，签发时随证书一并返回。
 > 好处是私钥丢失后仍可从平台重新获取（解决了旧版本地生成私钥丢失后只能重新签发的问题）；
 > 代价是私钥经过第三方（阿里云）生成与存储。
+>
+> **本项目仅支持该模式**：没有"本地生成密钥对 / 自定义 CSR / 自定义 SAN"的开关，
+> `--san` 与 `CERT_SANS` 会被忽略并告警（见 FAQ）。
 
 ---
 
@@ -306,8 +322,15 @@ A: `AliyunYundunCertFullAccess`（数字证书管理） + `AliyunDNSFullAccess`�
 **Q: 私钥存在哪里？**
 A: 私钥由阿里云生成并保管（平台托管模式），签发时随证书一并返回，同时写入本地 `key.pem`。之后平台仍可重新下载证书与私钥，本地文件丢失无需重新签发。
 
-**Q: 为什么自定义 SAN（`CERT_SANS`）不生效？**
-A: 平台托管模式下不传 CSR，SAN 由阿里云按主域名自动匹配（免费 DV 通常自动包含主域名 + `www.` 子域名）。需要额外 SAN 时请在阿里云控制台手动申请。
+**Q: 为什么自定义 SAN（`CERT_SANS` / `--san`）不生效？**
+A: 本工具**只使用平台托管模式**——申请时只提交 `domain`，不传 CSR、不传 SAN，密钥对由阿里云生成并保管，
+因此 SAN 无法由本项目指定，只能由阿里云按主域名自动匹配（免费 DV 通常自动包含主域名 + `www.` 子域名）。
+传入 `--san` / 设置 `CERT_SANS` 会被忽略并打印 `WARN`（不会静默丢弃），需要额外 SAN 请在阿里云控制台手动申请。
+本地生成密钥对 + 自定义 CSR 的模式不在本项目支持范围内。
+
+**Q: 怎么关闭 `fullchain.pem` 输出？**
+A: 用 `--no-fullchain`，或把环境变量显式设为空（`FULLCHAIN_FILE=` 后不写任何字符，Docker Compose 里写 `FULLCHAIN_FILE: ""`）。
+默认仍会写 `<cert-dir>/fullchain.pem`。
 
 **Q: 续期失败会通知我吗？**
 A: 当前仅写日志到 stdout / cron 日志文件。建议配合 cron 日志、`runitor` / `healthchecks.io` 之类的工具实现告警。

@@ -33,16 +33,18 @@
   CERT_DIR                         证书存放目录 (默认 ./certs)
   CERT_FILE                        证书文件路径 (覆盖 CERT_DIR/cert.pem)
   KEY_FILE                         私钥文件路径 (覆盖 CERT_DIR/key.pem)
-  FULLCHAIN_FILE                   完整链证书路径 (覆盖 CERT_DIR/fullchain.pem)
+  FULLCHAIN_FILE                   完整链证书路径 (覆盖 CERT_DIR/fullchain.pem)；
+                                   显式设为空字符串可关闭 fullchain 输出
   CERT_TYPE                        证书类型预设 (free-dv/dv/ov/ev)
   PRODUCT_CODE                     阿里云 product_code (覆盖 CERT_TYPE)
   RENEWAL_DAYS                     提前多少天续期 (默认 30)
-  CERT_SANS                        额外 SAN 域名，逗号分隔（仅用于日志展示；
-                                   平台托管模式下 SAN 由阿里云按主域名自动匹配，
-                                   需自定义 SAN 请在阿里云控制台申请）
+  CERT_SANS                        不支持：本工具仅使用平台托管模式（不传 CSR），
+                                   SAN 由阿里云按主域名自动匹配，此项会被忽略并告警
   ALIBABA_DNS_DOMAIN               阿里云 DNS 管理的域名 (默认同 CERT_DOMAIN)
   RELOAD_CMD                       自定义重载命令 (如 "docker compose restart blog")
   NO_RELOAD                        设为 1 禁用自动 reload
+  DAEMON                           设为 1 启用守护进程模式 (命令行指定模式时以命令行为准)
+  INTERVAL_HOURS                   守护进程检查间隔小时数 (默认 12)
 """
 
 import os
@@ -54,6 +56,19 @@ import signal
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
+
+# ---------- 密钥托管模式 ----------
+#
+# 本工具**只支持平台托管模式**：申请时不传 CSR、不传 SAN，密钥对由阿里云生成并保管，
+# 签发后连私钥一并返回（因此本地私钥丢失无需重新签发）。
+#
+# 与之相对的「本地生成密钥对 + 自定义 CSR/SAN」模式不在支持范围内，故：
+#   - create_certificate_order() 不接收 CSR / SAN 参数
+#   - --san / CERT_SANS 仅作兼容占位，传入会被忽略并告警（见 parse_args）
+# 若将来要新增 CSR 模式，需在此处扩展 KEY_MODE 并同步 README。
+
+KEY_MODE = "platform"
+KEY_MODE_LABEL = "平台托管（阿里云生成并保管私钥，不传 CSR/SAN）"
 
 # ---------- defaults & presets ----------
 
@@ -87,9 +102,8 @@ class Config:
     cert_dir: Path
     cert_file: Path
     key_file: Path
-    fullchain_file: Path
+    fullchain_file: Optional[Path] = None   # None = 关闭 fullchain 输出
     renewal_days: int = DEFAULT_RENEWAL_DAYS
-    sans: str = ""
     product_code: str = CERT_TYPE_PRESETS["free-dv"]
     no_reload: bool = False
     reload_cmd: Optional[str] = None
@@ -98,6 +112,7 @@ class Config:
     run_once: bool = False
     force_renew: bool = False
     renew: bool = False
+    check: bool = False
 
 
 # ---------- sdk imports (lazy) ----------
@@ -181,25 +196,28 @@ def days_until_expiry(expiry: datetime.datetime) -> int:
 
 # ---------- domain resolution ----------
 
-def resolve_cert_domains(primary_domain: str, extra_sans: str) -> list:
-    """解析目标域名列表（用于日志展示与核对，实际 SAN 由阿里云按 domain 自动匹配）"""
+def resolve_cert_domains(primary_domain: str) -> list:
+    """解析目标域名列表（仅用于日志展示与核对）
+
+    平台托管模式不传 CSR/SAN，实际 SAN 由阿里云按 domain 自动匹配
+    （免费 DV 通常自动包含主域名 + www. 子域名），因此这里只列出主域名与 www 形式。
+    """
     domains = [primary_domain]
-    if not primary_domain.startswith("www."):
+    if primary_domain and not primary_domain.startswith("www."):
         www_domain = f"www.{primary_domain}"
         if www_domain not in domains:
             domains.append(www_domain)
-    if extra_sans:
-        for s in extra_sans.split(","):
-            s = s.strip()
-            if s and s not in domains:
-                domains.append(s)
     return domains
 
 
 # ---------- CAS API ----------
 
 def create_certificate_order(domain: str, product_code: str) -> str:
-    """申请证书（不传 CSR，由阿里云生成并保管密钥对），返回 OrderId"""
+    """申请证书，返回 OrderId
+
+    平台托管模式：**不传 CSR、不传 SAN**，密钥对由阿里云生成并保管，
+    签发时随证书一并返回（私有化 CSR 模式不在本项目支持范围内）。
+    """
     client = _create_cas_client()
     req = CasModels.CreateCertificateForPackageRequestRequest(
         domain=domain,
@@ -553,7 +571,8 @@ def do_renew(cfg: Config) -> bool:
         log("错误: 未指定 --domain / CERT_DOMAIN")
         return False
 
-    log(f"目标域名列表: {resolve_cert_domains(cfg.domain, cfg.sans)}")
+    log(f"密钥托管模式: {KEY_MODE_LABEL}")
+    log(f"目标域名列表: {resolve_cert_domains(cfg.domain)}")
 
     log("===== 第 1 步：检查本地证书 =====")
     if check_local_cert_valid(cfg):
@@ -579,7 +598,8 @@ def do_renew_force(cfg: Config) -> bool:
         log("错误: 未指定 --domain / CERT_DOMAIN")
         return False
 
-    log(f"目标域名列表: {resolve_cert_domains(cfg.domain, cfg.sans)}")
+    log(f"密钥托管模式: {KEY_MODE_LABEL}")
+    log(f"目标域名列表: {resolve_cert_domains(cfg.domain)}")
     log("强制重新申请模式: 跳过本地和平台检查")
     return _apply_new_cert(cfg)
 
@@ -607,7 +627,7 @@ def _cleanup_failed_order(order_id: str) -> None:
 def _apply_new_cert(cfg: Config) -> bool:
     old_cert_exists = cfg.cert_file.exists() and cfg.key_file.exists()
 
-    log("使用平台生成密钥对模式（阿里云保管私钥，签发后回传）...")
+    log(f"申请方式: {KEY_MODE_LABEL}")
 
     try:
         order_id = create_certificate_order(cfg.domain, cfg.product_code)
@@ -707,7 +727,7 @@ def parse_args(argv=None) -> Config:
   # 自定义 reload 命令（如通过 docker）
   %(prog)s --renew --domain example.com --reload-cmd "docker compose restart blog"
 
-  # 续期后不执行 reload（默认行为）
+  # 续期后不执行 reload（容器部署常用，如证书由其他服务 watch）
   %(prog)s --renew --domain example.com --no-reload
 
   # 守护进程模式（容器化部署推荐）
@@ -729,13 +749,17 @@ def parse_args(argv=None) -> Config:
     cert_opts.add_argument("--key-file", default=None,
                            help="私钥文件路径（覆盖 --cert-dir/key.pem）")
     cert_opts.add_argument("--fullchain-file", default=None,
-                           help="完整链证书路径（覆盖 --cert-dir/fullchain.pem，可省略）")
+                           help="完整链证书路径（覆盖 --cert-dir/fullchain.pem；"
+                                "显式传空字符串可关闭输出）")
+    cert_opts.add_argument("--no-fullchain", action="store_true",
+                           help="不写出 fullchain.pem（等价于 FULLCHAIN_FILE=\"\"）")
 
     domain_opts = parser.add_argument_group("域名 / 证书类型")
     domain_opts.add_argument("--domain", default=None,
                             help="证书主域名 (可由环境变量 CERT_DOMAIN 提供)")
     domain_opts.add_argument("--san", default=None,
-                            help="额外 SAN 域名，逗号分隔")
+                            help="【不支持】平台托管模式不传 CSR/SAN，SAN 由阿里云按主域名自动匹配，"
+                                 "传入此参数仅会打印告警并被忽略")
     domain_opts.add_argument("--dns-domain", default=None,
                             help="阿里云 DNS 托管域名，用于自动添加验证记录 (默认同 --domain)")
     domain_opts.add_argument("--renewal-days", type=int, default=None,
@@ -792,7 +816,13 @@ def parse_args(argv=None) -> Config:
     cfg.domain = args.domain or os.environ.get("CERT_DOMAIN", "")
     cfg.dns_domain = (args.dns_domain or os.environ.get("ALIBABA_DNS_DOMAIN", "")
                       or cfg.domain)
-    cfg.sans = args.san if args.san is not None else os.environ.get("CERT_SANS", "")
+
+    # SAN：本项目只使用平台托管模式（不传 CSR），SAN 由阿里云按主域名自动匹配，
+    # 因此 --san / CERT_SANS 一律忽略，但要明确告警而不是静默丢弃
+    raw_sans = args.san if args.san is not None else os.environ.get("CERT_SANS", "")
+    if raw_sans.strip():
+        log(f"WARN: 平台托管模式不支持自定义 SAN（收到 {raw_sans!r}），已忽略；"
+            f"需要额外 SAN 请在阿里云 SSL 证书控制台手动申请")
 
     # renewal days
     if args.renewal_days is not None:
@@ -818,9 +848,24 @@ def parse_args(argv=None) -> Config:
     cfg.cert_dir = Path(cert_dir).expanduser()
     cfg.cert_file = Path(args.cert_file or os.environ.get("CERT_FILE") or (cfg.cert_dir / "cert.pem")).expanduser()
     cfg.key_file = Path(args.key_file or os.environ.get("KEY_FILE") or (cfg.cert_dir / "key.pem")).expanduser()
-    cfg.fullchain_file = Path(args.fullchain_file or os.environ.get("FULLCHAIN_FILE") or (cfg.cert_dir / "fullchain.pem")).expanduser()
-    # 如果用户既没指定 --fullchain-file 也没显式启用，默认仍写入 fullchain（兼容 nginx 配置）
-    # 如果用户想关闭 fullchain，可显式传 --cert-file/--key-file 而不传 --fullchain-file，并设置 FULLCHAIN_FILE=""
+
+    # fullchain: 必须区分「未设置」和「显式置空」两种情况——
+    #   未设置           → 默认 <cert_dir>/fullchain.pem
+    #   显式空字符串     → 关闭输出（注意 Path("") 会退化成 "."，不能用真值/空串比较来判断）
+    #   --no-fullchain   → 关闭输出
+    if args.no_fullchain:
+        cfg.fullchain_file = None
+        log("已通过 --no-fullchain 关闭 fullchain 输出")
+    else:
+        raw_fullchain = (args.fullchain_file if args.fullchain_file is not None
+                         else os.environ.get("FULLCHAIN_FILE"))
+        if raw_fullchain is not None and raw_fullchain.strip() == "":
+            cfg.fullchain_file = None
+            log("FULLCHAIN_FILE 为空字符串，已关闭 fullchain 输出")
+        elif raw_fullchain:
+            cfg.fullchain_file = Path(raw_fullchain).expanduser()
+        else:
+            cfg.fullchain_file = cfg.cert_dir / "fullchain.pem"
 
     # reload
     if args.no_reload:
@@ -830,7 +875,14 @@ def parse_args(argv=None) -> Config:
     cfg.reload_cmd = args.reload_cmd or os.environ.get("RELOAD_CMD")
 
     # daemon
-    cfg.daemon = args.daemon or os.environ.get("DAEMON") in ("1", "true", "yes", "TRUE", "YES", "True")
+    # 运行模式遵循 README 承诺的优先级：命令行 > 环境变量。
+    # 镜像内默认 ENV DAEMON=1，但用户显式传了 --check/--renew/--force-renew 时，
+    # 应由命令行决定模式，否则容器里连 --check 都会变成守护进程长跑。
+    _truthy = ("1", "true", "yes", "TRUE", "YES", "True")
+    cli_mode_given = args.check or args.renew or args.force_renew
+    if cli_mode_given and os.environ.get("DAEMON") in _truthy:
+        log("命令行已指定运行模式，忽略环境变量 DAEMON=1")
+    cfg.daemon = args.daemon or (not cli_mode_given and os.environ.get("DAEMON") in _truthy)
     if args.interval_hours is not None:
         cfg.interval_hours = args.interval_hours
     elif os.environ.get("INTERVAL_HOURS"):
@@ -844,6 +896,7 @@ def parse_args(argv=None) -> Config:
     cfg.run_once = args.run_once
     cfg.force_renew = args.force_renew
     cfg.renew = args.renew
+    cfg.check = args.check
 
     return cfg
 
@@ -875,18 +928,26 @@ def _handle_signal(signum, frame):
 
 
 def run_daemon(cfg: Config) -> None:
-    """守护进程：周期性执行 --renew，间隔由 cfg.interval_hours 控制"""
+    """守护进程：周期性执行 --renew（或 --force-renew，仅限 --run-once），
+    间隔由 cfg.interval_hours 控制"""
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # --force-renew 会跳过本地/平台检查直接重新签发，长跑会每轮重复签发，
+    # 因此只允许配合 --run-once（main() 已做校验），此处再兜底一次
+    renew_fn = do_renew_force if cfg.force_renew else do_renew
+    if cfg.force_renew:
+        log("daemon: --force-renew 已启用（跳过本地/平台检查，强制重新申请）")
 
     interval_seconds = max(60, int(cfg.interval_hours * 3600))
     log(f"启动 daemon：每 {cfg.interval_hours:g} 小时执行一次续期检查 (PID={os.getpid()})")
     log(f"首次执行立即开始，之后按间隔周期运行；收到 SIGTERM/SIGINT 优雅退出")
 
+
     while not _STOP:
         log("===== daemon: 触发续期检查 =====")
         try:
-            do_renew(cfg)
+            renew_fn(cfg)
         except Exception as e:
             log(f"daemon: 续期异常（不退出，等待下一轮）: {e}")
 
@@ -906,16 +967,22 @@ def run_daemon(cfg: Config) -> None:
 def main() -> None:
     cfg = parse_args()
 
+    # 模式冲突校验（先于凭证校验，确保用户能看到真正的问题）
+    if cfg.daemon:
+        if cfg.force_renew and not cfg.run_once:
+            log("错误: --daemon + --force-renew 会每轮跳过检查强制重新签发证书，已拒绝启动")
+            log("  只需强制签发一次: --daemon --force-renew --run-once")
+            log("  长期守护请去掉 --force-renew（--renew 的三步检查本身就包含按需续期）")
+            sys.exit(2)
+        if cfg.check:
+            log("WARN: --daemon 模式下 --check 被忽略，daemon 只执行续期检查")
+
     ak_id = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "")
     ak_secret = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "")
     if not ak_id or not ak_secret:
         log("错误: 请设置 ALIBABA_CLOUD_ACCESS_KEY_ID 和 ALIBABA_CLOUD_ACCESS_KEY_SECRET")
         log("  可在 .env 文件中配置，或通过环境变量传入")
         sys.exit(1)
-
-    if cfg.fullchain_file == Path(""):
-        # 用户显式禁用 fullchain
-        cfg.fullchain_file = None
 
     if cfg.daemon:
         run_daemon(cfg)
