@@ -52,6 +52,11 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+> 若构建时 `pip` 拉包失败（国内网络或公司代理拦截），可换镜像源后重试：
+> ```bash
+> PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose up -d --build
+> ```
+
 ### 3. 查看日志 / 状态
 
 ```bash

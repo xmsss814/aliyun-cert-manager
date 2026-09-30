@@ -4,6 +4,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # 构建镜像时的 pip 源；国内/公司代理环境可用
+        # PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build 覆盖
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     container_name: aliyun-cert-manager
     restart: unless-stopped
     # 守护进程模式由镜像内默认参数保证；这里只覆盖间隔
