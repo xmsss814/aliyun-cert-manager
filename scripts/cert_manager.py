@@ -11,6 +11,7 @@
   4. 自动完成 DNS 验证（需阿里云 DNS 服务）
   5. 下载证书到指定目录或文件路径
   6. 守护进程模式 (--daemon)，定时执行续期检查（用于容器化部署）
+  7. 可选邮件通知（QQ 邮箱 SMTP）：续期成功 / 失败时发信，默认关闭
 
 使用方式:
   python3 cert_manager.py --check                 # 检查本地和平台证书状态
@@ -45,6 +46,15 @@
   NO_RELOAD                        设为 1 禁用自动 reload
   DAEMON                           设为 1 启用守护进程模式 (命令行指定模式时以命令行为准)
   INTERVAL_HOURS                   守护进程检查间隔小时数 (默认 12)
+
+  NOTIFY_ENABLED                   设为 1 启用邮件通知 (默认关闭)
+  SMTP_HOST / SMTP_PORT            邮件服务器 (默认 smtp.qq.com:465)
+  SMTP_SECURITY                    ssl / starttls / plain (默认 ssl，对应 465 端口)
+  SMTP_USER                        SMTP 登录名，即 QQ 邮箱地址
+  SMTP_PASSWORD                    SMTP 密码：QQ 邮箱「授权码」(非 QQ 登录密码)
+  NOTIFY_FROM                      发件人 (默认同 SMTP_USER)
+  NOTIFY_TO                        收件人，逗号分隔 (默认同 SMTP_USER)
+  NOTIFY_ON_NOOP                   设为 1 时"无需续期"也发通知 (默认 0，只在续期/失败时发信)
 """
 
 import os
@@ -53,9 +63,11 @@ import time
 import argparse
 import datetime
 import signal
+import smtplib
 import subprocess
+from email.message import EmailMessage
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 # ---------- 密钥托管模式 ----------
 #
@@ -88,9 +100,23 @@ CERT_TYPE_PRESETS = {
 
 # ---------- logging ----------
 
+# 本轮运行的日志缓冲，用于失败/成功通知邮件正文（只保留最近 MAX_RUN_LOG 行）
+_RUN_LOG: List[str] = []
+MAX_RUN_LOG = 300
+
+
 def log(msg: str) -> None:
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    _RUN_LOG.append(line)
+    if len(_RUN_LOG) > MAX_RUN_LOG:
+        del _RUN_LOG[:-MAX_RUN_LOG]
+
+
+def reset_run_log() -> None:
+    """每轮续期开始前调用，保证通知邮件只包含本轮日志"""
+    _RUN_LOG.clear()
 
 
 # ---------- config container ----------
@@ -113,6 +139,9 @@ class Config:
     force_renew: bool = False
     renew: bool = False
     check: bool = False
+    # 本轮实际动作：skip(无需续期) / platform(复用平台证书) / new(新签发) / failed
+    last_action: str = ""
+    last_error: str = ""
 
 
 # ---------- sdk imports (lazy) ----------
@@ -565,10 +594,17 @@ def check_local_cert_valid(cfg: Config) -> bool:
 
 # ---------- renewal flows ----------
 
+def _set_action(cfg: Config, action: str, error: str = "") -> None:
+    """记录本轮实际动作，供通知邮件判断是否需要发信"""
+    cfg.last_action = action
+    cfg.last_error = error
+
+
 def do_renew(cfg: Config) -> bool:
     """三步续期：本地 → 平台 → 新建"""
     if not cfg.domain:
         log("错误: 未指定 --domain / CERT_DOMAIN")
+        _set_action(cfg, "failed", "未指定域名")
         return False
 
     log(f"密钥托管模式: {KEY_MODE_LABEL}")
@@ -576,6 +612,7 @@ def do_renew(cfg: Config) -> bool:
 
     log("===== 第 1 步：检查本地证书 =====")
     if check_local_cert_valid(cfg):
+        _set_action(cfg, "skip")
         return True
 
     log("===== 第 2 步：检查平台已有证书 =====")
@@ -585,7 +622,10 @@ def do_renew(cfg: Config) -> bool:
         if cert_key:
             cert_pem, key_pem = cert_key
             log("平台证书含私钥，直接使用")
-            return save_and_apply_cert(cfg, cert_pem, key_pem)
+            ok = save_and_apply_cert(cfg, cert_pem, key_pem)
+            _set_action(cfg, "platform" if ok else "failed",
+                        "" if ok else "平台证书保存/部署失败")
+            return ok
         log("下载平台证书失败，需要重新申请")
 
     log("===== 第 3 步：申请新证书 =====")
@@ -596,6 +636,7 @@ def do_renew_force(cfg: Config) -> bool:
     """强制重新申请证书（跳过本地和平台检查）"""
     if not cfg.domain:
         log("错误: 未指定 --domain / CERT_DOMAIN")
+        _set_action(cfg, "failed", "未指定域名")
         return False
 
     log(f"密钥托管模式: {KEY_MODE_LABEL}")
@@ -633,6 +674,7 @@ def _apply_new_cert(cfg: Config) -> bool:
         order_id = create_certificate_order(cfg.domain, cfg.product_code)
     except Exception as e:
         log(f"创建证书订单失败: {e}")
+        _set_action(cfg, "failed", f"创建证书订单失败: {e}")
         return False
 
     try:
@@ -640,22 +682,29 @@ def _apply_new_cert(cfg: Config) -> bool:
     except KeyboardInterrupt:
         log("用户中断，清理订单 ...")
         _cleanup_failed_order(order_id)
+        _set_action(cfg, "failed", "用户中断")
         return False
     except Exception as e:
         log(f"等待签发时出错: {e}")
         # 警告：域名托管在阿里云 DNS 时，残留订单仍可能被平台自动验证并签发
         _cleanup_failed_order(order_id)
+        _set_action(cfg, "failed", f"等待签发出错: {e}")
         return False
 
     if not result:
         log("未能获取证书，清理订单 ...")
         _cleanup_failed_order(order_id)
+        _set_action(cfg, "failed", "订单未在超时时间内签发")
         return False
 
     cert_pem, key_pem = result
     success = save_and_apply_cert(cfg, cert_pem, key_pem)
     if not success and old_cert_exists:
         log("新证书安装失败，旧证书仍然有效，请手动排查")
+    elif not success:
+        log("新证书安装失败")
+    _set_action(cfg, "new" if success else "failed",
+                "" if success else "新证书保存/部署失败")
     return success
 
 
@@ -700,6 +749,160 @@ def do_check(cfg: Config) -> None:
             log("如需使用平台证书，运行 --renew 会自动下载")
         else:
             log("平台上未找到有效证书，运行 --renew 将自动申请新证书")
+
+
+# ---------- 通知（QQ 邮箱 SMTP） ----------
+#
+# 默认关闭；NOTIFY_ENABLED=1 才启用。使用标准库 smtplib，无额外依赖。
+# QQ 邮箱要点：SMTP_HOST=smtp.qq.com，SMTP_PORT=465（SSL），
+# SMTP_PASSWORD 必须填「授权码」（QQ 邮箱 → 设置 → 账户 → POP3/IMAP/SMTP 服务 中生成），
+# 不是 QQ 登录密码。
+
+NOTIFY_DEFAULT_HOST = "smtp.qq.com"
+NOTIFY_DEFAULT_PORT = 465
+NOTIFY_DEFAULT_SECURITY = "ssl"
+NOTIFY_SECURITIES = ("ssl", "starttls", "plain")
+
+
+class NotifyConfig:
+    """邮件通知配置（全部来自环境变量 / .env）"""
+    enabled: bool = False
+    host: str = NOTIFY_DEFAULT_HOST
+    port: int = NOTIFY_DEFAULT_PORT
+    security: str = NOTIFY_DEFAULT_SECURITY
+    user: str = ""
+    password: str = ""
+    sender: str = ""
+    recipients: List[str] = []
+    on_noop: bool = False       # 是否在"无需续期"时也发通知（默认不发）
+    timeout: int = 20
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+def load_notify_config() -> NotifyConfig:
+    nc = NotifyConfig()
+    nc.enabled = _env_truthy("NOTIFY_ENABLED")
+
+    nc.host = (os.environ.get("SMTP_HOST") or "").strip() or NOTIFY_DEFAULT_HOST
+    port_raw = (os.environ.get("SMTP_PORT") or "").strip()
+    if port_raw:
+        try:
+            nc.port = int(port_raw)
+        except ValueError:
+            log(f"WARN: SMTP_PORT={port_raw!r} 非整数，使用默认 {NOTIFY_DEFAULT_PORT}")
+            nc.port = NOTIFY_DEFAULT_PORT
+
+    security = (os.environ.get("SMTP_SECURITY") or "").strip().lower() or NOTIFY_DEFAULT_SECURITY
+    if security not in NOTIFY_SECURITIES:
+        log(f"WARN: SMTP_SECURITY={security!r} 不支持（可选 {'/'.join(NOTIFY_SECURITIES)}），使用 {NOTIFY_DEFAULT_SECURITY}")
+        security = NOTIFY_DEFAULT_SECURITY
+    nc.security = security
+
+    nc.user = (os.environ.get("SMTP_USER") or "").strip()
+    nc.password = os.environ.get("SMTP_PASSWORD") or ""
+    nc.sender = (os.environ.get("NOTIFY_FROM") or "").strip() or nc.user
+
+    to_raw = (os.environ.get("NOTIFY_TO") or "").strip() or nc.user
+    nc.recipients = [x.strip() for x in to_raw.replace(";", ",").split(",") if x.strip()]
+
+    nc.on_noop = _env_truthy("NOTIFY_ON_NOOP")
+
+    if nc.enabled:
+        missing = []
+        if not nc.user:
+            missing.append("SMTP_USER")
+        if not nc.password:
+            missing.append("SMTP_PASSWORD")
+        if not nc.recipients:
+            missing.append("NOTIFY_TO")
+        if missing:
+            log(f"WARN: NOTIFY_ENABLED 已开启但缺少 {'/'.join(missing)}，本轮不发送邮件通知")
+            nc.enabled = False
+        else:
+            log(f"邮件通知已启用: {nc.host}:{nc.port} ({nc.security}) -> {', '.join(nc.recipients)}")
+    return nc
+
+
+def send_notify_mail(nc: NotifyConfig, subject: str, body: str) -> bool:
+    """发送通知邮件；任何失败只告警，绝不影响证书续期结果"""
+    if not nc.enabled:
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = nc.sender
+    msg["To"] = ", ".join(nc.recipients)
+    msg.set_content(body)
+    try:
+        if nc.security == "ssl":
+            server = smtplib.SMTP_SSL(nc.host, nc.port, timeout=nc.timeout)
+        else:
+            server = smtplib.SMTP(nc.host, nc.port, timeout=nc.timeout)
+        with server:
+            server.ehlo()
+            if nc.security == "starttls":
+                server.starttls()
+                server.ehlo()
+            if nc.user:
+                server.login(nc.user, nc.password)
+            server.send_message(msg)
+        log(f"通知邮件已发送: {subject} -> {', '.join(nc.recipients)}")
+        return True
+    except Exception as e:
+        log(f"WARN: 通知邮件发送失败（证书续期结果不受影响）: {e}")
+        return False
+
+
+def _cert_status_lines(cfg: Config) -> List[str]:
+    """通知正文里的证书状态摘要"""
+    lines = [f"证书文件: {cfg.cert_file}", f"私钥文件: {cfg.key_file}"]
+    lines.append(f"完整链文件: {cfg.fullchain_file if cfg.fullchain_file else '(已关闭)'}")
+    expiry = parse_cert_expiry(cfg.cert_file) if cfg.cert_file.exists() else None
+    if expiry:
+        lines.append(f"证书过期时间: {expiry.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        lines.append(f"剩余天数: {days_until_expiry(expiry)} 天（续期阈值 {cfg.renewal_days} 天）")
+    else:
+        lines.append("证书过期时间: (无法解析或文件不存在)")
+    return lines
+
+
+def notify_renew_outcome(nc: NotifyConfig, cfg: Config, ok: bool) -> None:
+    """按动作类型决定是否发信：失败必发；实际续期(新建/复用)发；无需续期默认不发"""
+    if not nc.enabled:
+        return
+
+    action = cfg.last_action or ("failed" if not ok else "new")
+    if ok and action == "skip" and not nc.on_noop:
+        log("无需续期且 NOTIFY_ON_NOOP 未开启，跳过邮件通知")
+        return
+
+    domain = cfg.domain or "(未配置域名)"
+    if not ok:
+        subject = f"[证书续期失败] {domain}"
+        result = "失败" + (f"（{cfg.last_error}）" if cfg.last_error else "")
+    elif action == "platform":
+        subject = f"[证书续期成功] {domain}（复用平台证书）"
+        result = "成功：已从平台下载并部署证书（未重新签发）"
+    elif action == "skip":
+        subject = f"[证书检查] {domain} 无需续期"
+        result = "无需处理：本地证书仍在有效期内"
+    else:
+        subject = f"[证书续期成功] {domain}（新签发）"
+        result = "成功：已申请并部署新证书"
+
+    header = [
+        f"域名: {domain}",
+        f"结果: {result}",
+        f"时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"密钥模式: {KEY_MODE_LABEL}",
+    ]
+    body = "\n".join(header + _cert_status_lines(cfg)) + "\n\n----- 本轮运行日志 -----\n" + "\n".join(_RUN_LOG) + "\n"
+    send_notify_mail(nc, subject, body)
 
 
 # ---------- arg parsing ----------
@@ -943,13 +1146,18 @@ def run_daemon(cfg: Config) -> None:
     log(f"启动 daemon：每 {cfg.interval_hours:g} 小时执行一次续期检查 (PID={os.getpid()})")
     log(f"首次执行立即开始，之后按间隔周期运行；收到 SIGTERM/SIGINT 优雅退出")
 
+    notify_cfg = load_notify_config()
 
     while not _STOP:
+        reset_run_log()
         log("===== daemon: 触发续期检查 =====")
         try:
-            renew_fn(cfg)
+            ok = renew_fn(cfg)
+            notify_renew_outcome(notify_cfg, cfg, ok)
         except Exception as e:
             log(f"daemon: 续期异常（不退出，等待下一轮）: {e}")
+            _set_action(cfg, "failed", f"未捕获异常: {e}")
+            notify_renew_outcome(notify_cfg, cfg, False)
 
         if cfg.run_once:
             log("--run-once 已设置，daemon 在执行一次后退出")
@@ -989,11 +1197,17 @@ def main() -> None:
         return
 
     if cfg.force_renew:
+        reset_run_log()
+        notify_cfg = load_notify_config()
         ok = do_renew_force(cfg)
+        notify_renew_outcome(notify_cfg, cfg, ok)
         sys.exit(0 if ok else 1)
 
     if cfg.renew:
+        reset_run_log()
+        notify_cfg = load_notify_config()
         ok = do_renew(cfg)
+        notify_renew_outcome(notify_cfg, cfg, ok)
         sys.exit(0 if ok else 1)
 
     do_check(cfg)

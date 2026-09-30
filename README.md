@@ -9,6 +9,7 @@
 - 灵活指定证书/私钥文件路径或目录
 - 可选的 nginx reload 或自定义重载命令
 - **Docker Compose 守护进程部署**（推荐）或 cron 定时
+- 可选的**邮件通知**（QQ 邮箱 SMTP）：续期成功 / 失败时自动发信
 
 > 密钥托管：**仅支持平台托管模式** —— 申请时不传 CSR/SAN，密钥对由阿里云生成并保管，签发后连私钥一并返回。
 > 因此不支持自定义 SAN（`--san` / `CERT_SANS` 会被忽略并告警），详见下文与 FAQ。
@@ -77,6 +78,15 @@ docker compose restart                  # 立即触发一轮检查（容器重�
 | `INTERVAL_HOURS` | 守护进程检查间隔（小时） | `12` |
 | `NO_RELOAD` | 1=禁用 reload（Docker 默认禁用） | `1` |
 | `RELOAD_CMD` | 自定义 reload 命令 | |
+| `NOTIFY_ENABLED` | 1=启用邮件通知 | `0` |
+| `SMTP_HOST` / `SMTP_PORT` | 邮件服务器 | `smtp.qq.com` / `465` |
+| `SMTP_SECURITY` | `ssl` / `starttls` / `plain` | `ssl` |
+| `SMTP_USER` | 发件 QQ 邮箱地址 | |
+| `SMTP_PASSWORD` | QQ 邮箱**授权码**（非登录密码） | |
+| `NOTIFY_TO` | 收件人，逗号分隔 | 同 `SMTP_USER` |
+| `NOTIFY_ON_NOOP` | 1=「无需续期」也发信 | `0` |
+
+> 邮件通知的完整说明见 [邮件通知（QQ 邮箱）](#邮件通知qq-邮箱)。
 
 ### 在容器内 reload 其他服务
 
@@ -311,6 +321,50 @@ cron 调用项目内的 `cert_manager.py --renew`，日志写入 `~/aliyun-cert-
 
 ---
 
+## 邮件通知（QQ 邮箱）
+
+可选功能，默认关闭；使用 Python 标准库 `smtplib`，无额外依赖。
+
+### 1. 获取 QQ 邮箱授权码
+
+登录 QQ 邮箱网页版 → **设置 → 账户** → 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务」→
+开启 **SMTP 服务**，按提示生成 **授权码**（16 位）。
+
+> `SMTP_PASSWORD` 必须填这个**授权码**，不是 QQ 登录密码，也不是邮箱独立密码。
+
+### 2. 配置
+
+写入 `.env`（容器部署时 `docker-compose.yml` 已透传这些变量，无需改 compose 文件）：
+
+```bash
+NOTIFY_ENABLED=1
+SMTP_HOST=smtp.qq.com                  # 默认值
+SMTP_PORT=465                          # 默认值
+SMTP_SECURITY=ssl                      # 465 用 ssl，587 用 starttls
+SMTP_USER=you@qq.com                   # 发件邮箱
+SMTP_PASSWORD=xxxxxxxxxxxxxxxx         # 授权码（16 位）
+NOTIFY_TO=you@qq.com,ops@example.com   # 可省略，默认发给 SMTP_USER
+NOTIFY_ON_NOOP=0                       # 1 = 无需续期也发信
+```
+
+非 Docker 场景（venv + cron）同样读取 `.env` 或环境变量，无需额外配置。
+
+### 3. 发信时机
+
+| 场景 | 是否发信 | 邮件标题 |
+| --- | --- | --- |
+| 新签发证书并部署成功 | ✅ | `[证书续期成功] example.com（新签发）` |
+| 复用平台已有证书 | ✅ | `[证书续期成功] example.com（复用平台证书）` |
+| 续期失败 / 异常 / 超时 / 保存失败 | ✅ | `[证书续期失败] example.com` |
+| 本地证书仍有效，无需处理 | 仅当 `NOTIFY_ON_NOOP=1` | `[证书检查] example.com 无需续期` |
+
+正文包含域名、结果、证书/私钥/完整链路径、证书过期时间与剩余天数，以及本轮完整运行日志。
+
+> 邮件发送失败只打印 `WARN`，**不会影响证书续期本身**；`NOTIFY_ENABLED=1` 但缺少
+> `SMTP_USER` / `SMTP_PASSWORD` / `NOTIFY_TO` 时会在启动日志中告警并跳过发信。
+
+---
+
 ## FAQ
 
 **Q: 一定要把域名 DNS 也托管在阿里云吗？**
@@ -333,7 +387,9 @@ A: 用 `--no-fullchain`，或把环境变量显式设为空（`FULLCHAIN_FILE=` 
 默认仍会写 `<cert-dir>/fullchain.pem`。
 
 **Q: 续期失败会通知我吗？**
-A: 当前仅写日志到 stdout / cron 日志文件。建议配合 cron 日志、`runitor` / `healthchecks.io` 之类的工具实现告警。
+A: 可以。设置 `NOTIFY_ENABLED=1` 并配好 `SMTP_USER` / `SMTP_PASSWORD`（QQ 邮箱授权码）/ `NOTIFY_TO` 后，
+续期成功、失败都会发邮件，详见 [邮件通知（QQ 邮箱）](#邮件通知qq-邮箱)。
+未开启通知时仅写日志到 stdout / cron 日志文件，可配合 `runitor` / `healthchecks.io` 之类的工具实现告警。
 
 ---
 

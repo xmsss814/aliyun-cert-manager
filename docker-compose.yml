@@ -22,6 +22,15 @@ services:
       # —— 部署 ——
       NO_RELOAD: ${NO_RELOAD:-1}
       RELOAD_CMD: ${RELOAD_CMD:-}
+      # —— 邮件通知（QQ 邮箱，可选；NOTIFY_ENABLED=1 时生效）——
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED:-0}
+      SMTP_HOST: ${SMTP_HOST:-smtp.qq.com}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SECURITY: ${SMTP_SECURITY:-ssl}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      NOTIFY_TO: ${NOTIFY_TO:-}
+      NOTIFY_ON_NOOP: ${NOTIFY_ON_NOOP:-0}
     volumes:
       # 证书持久化到宿主机
       - ./certs:/data/certs
